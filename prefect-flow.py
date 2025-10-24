@@ -16,7 +16,7 @@ def fetch_messages():
     logger.info("Fetching SQS URL from external API...retrieving 21 new messages")
     try:
         url = "https://j9y2xa0vx0.execute-api.us-east-1.amazonaws.com/api/scatter/zzz2bx"
-        payload = requests.post(url).json()
+        payload = requests.post(url).json
         sqs_url = payload.get("sqs_url")
         logger.info(f"Retrieved SQS URL: {sqs_url}")
         if not sqs_url:
@@ -205,5 +205,8 @@ def master_sqs_puzzle_flow(sqs_url: str, collected_fragments: List[Tuple[int, st
 @flow(name="Initialize")
 def initialize_queue_flow():
     return fetch_messages()
+
+if __name__ == "__main__":
+    initialize_queue_flow()
             
 
