@@ -16,7 +16,7 @@ def fetch_messages():
     logger.info("Fetching SQS URL from external API...retrieving 21 new messages")
     try:
         url = "https://j9y2xa0vx0.execute-api.us-east-1.amazonaws.com/api/scatter/zzz2bx"
-        payload = requests.post(url).json
+        payload = requests.post(url).json()
         sqs_url = payload.get("sqs_url")
         logger.info(f"Retrieved SQS URL: {sqs_url}")
         if not sqs_url:
@@ -87,11 +87,11 @@ def collect_messages(sqs_url: str)-> List[Tuple[int, int, str]]:
 @task(name = "Delete Messages")
 def delete_messages(sqs_url: str, messages_to_delete: List[Tuple[int, str, str]]) -> int:
     logger = get_run_logger()
-    logger.info = "Deleting processed messages from SQS"
+    logger.info("Deleting processed messages from SQS")
     
     #creates unique id and receipt handle pairs for deletion
     receipt_handles = [
-        {'Id': int(order_no), 'ReceiptHandle': handle}
+        {'Id': str(order_no), 'ReceiptHandle': handle}
         for order_no, word, handle in messages_to_delete
     ]
 
@@ -118,9 +118,92 @@ def delete_messages(sqs_url: str, messages_to_delete: List[Tuple[int, str, str]]
                 logger.error(f"{failed_deletions} messages failed to delete in this batch.")
 
             deleted_messages += successful_deletions_count
-
+            logger.info(f"Deleted {successful_deletions_count} messages in this batch.")
         except Exception as e:
             logger.error(f"Error deleting messages: {e}")
         
-        logger.info(f"Deleted {len(successful_deletions)} messages in this batch.")
-        return deleted_messages
+    logger.info(f"Total messages deleted in this run: {deleted_messages}")
+    return deleted_messages
+
+@task(name = "Reassemble and Submit Total Messages")
+def submit_total_messages(all_messages: List[Tuple[int, str]]):
+    logger = get_run_logger()
+    logger.info("Reassembling and submitting total messages to external endpoint")
+
+    if len(all_messages) != TOTAL_MESSAGES:
+        logger.error(f"Cannot submit: Expected {TOTAL_MESSAGES} fragments but only received {len(all_messages)}.")
+        return
+    
+    sorted_messages = sorted(all_messages, key=lambda x: x[0])
+    
+    final_message = ''.join(word for order_no, word in sorted_messages)  
+
+    logger.info(f"Final reassembled message: {final_message}")        
+    
+    try:
+        response = SQS_CLIENT.send_message(
+            QueueUrl=SUBMISSION_URL,
+            MessageBody= 'Final Message to Submit from Anna Yao',
+            MessageAttributes={
+                'uvaid': {
+                    'DataType': 'String',
+                    'StringValue': 'zzz2bx'
+                },
+                'phrase': {
+                    'DataType': 'String',
+                    'StringValue': final_message
+                },
+                'platform': {
+                    'DataType': 'String',
+                    'StringValue': 'Prefect'
+                }
+            }
+        )
+        print(f"Response: {response}")
+        
+        response.raise_for_status()
+        if response.status_code != 200:
+            logger.error(f"Failed to submit message. Status code: {response.status_code}, Response: {response.text}")
+            return
+        logger.info(f"Successfully submitted message. Response: {response.text}")
+    except httpx.HTTPError as e:
+        logger.error(f"Error submitting final message: {e}")
+        
+
+@flow(name = "SQS Message Processing Flow")
+def master_sqs_puzzle_flow(sqs_url: str, collected_fragments: List[Tuple[int, str]] = None) -> List[Tuple[int, str]]:
+    logger = get_run_logger()
+    if collected_fragments is None:
+        collected_fragments = []
+
+    total_in_queue = get_total_message_count(sqs_url)
+
+    if total_in_queue > 0:
+        new_messages = collect_messages(sqs_url)
+        if new_messages:
+            new_fragments = [(order_no, word) for order_no, word, handle in new_messages]
+            
+            logger.info(f"Appended {len(new_fragments)} new fragments")
+
+            delete_messages(sqs_url, new_messages)
+
+            return new_fragments
+        else:
+            logger.info("No visible messages to collect. Waiting for delayed messages to expire.")
+            return []
+    elif total_in_queue == 0:
+        logger.info("Queue is empty. Checking for collected fragments to submit.")
+        if len(collected_fragments) == TOTAL_MESSAGES:
+            submit_total_messages(collected_fragments)
+            return collected_fragments
+        else:
+            logger.warning(f"Queue is empty, but only {len(collected_fragments)} fragments were accumulated. Check previous run logs or data persistence.")
+            return collected_fragments
+    
+    return []     
+
+@flow(name="Initialize")
+def initialize_queue_flow():
+    return fetch_messages()
+            
+
