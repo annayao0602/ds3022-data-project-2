@@ -5,18 +5,22 @@ import requests
 import boto3
 from prefect.logging import get_run_logger
 from typing import List, Tuple
+import duckdb
+import time
 
 TOTAL_MESSAGES = 21
 SUBMISSION_URL = "https://sqs.us-east-1.amazonaws.com/440848399208/dp2-submit"
 SQS_CLIENT = boto3.client('sqs')
+DUCKDB_FILE = 'puzzle.db'
 
+#initial task to receive SQS URL from external API
 @task(name ="Fetch Messages")
 def fetch_messages():
     logger = get_run_logger()
     logger.info("Fetching SQS URL from external API...retrieving 21 new messages")
     try:
         url = "https://j9y2xa0vx0.execute-api.us-east-1.amazonaws.com/api/scatter/zzz2bx"
-        payload = requests.post(url).json
+        payload = requests.post(url).json()
         sqs_url = payload.get("sqs_url")
         logger.info(f"Retrieved SQS URL: {sqs_url}")
         if not sqs_url:
@@ -25,7 +29,7 @@ def fetch_messages():
     except requests.exceptions.RequestException as e:
         logger.error(f"Error fetching SQS URL: {e}")
         raise
-
+#uses get_queue_attributes to get total message count in SQS
 @task(name = "Process Current Messages")
 def get_total_message_count(sqs_url: str) -> int:
     logger = get_run_logger()
@@ -43,7 +47,9 @@ def get_total_message_count(sqs_url: str) -> int:
         return total_count
     except Exception as e:
         logger.error(f"Error processing SQS messages: {e}")
+        return -1
 
+#task to collect messages from the sqs client, pulling order_no and word attributes
 @task(name = 'Collect Messages')
 def collect_messages(sqs_url: str)-> List[Tuple[int, int, str]]:
     logger = get_run_logger()
@@ -64,6 +70,7 @@ def collect_messages(sqs_url: str)-> List[Tuple[int, int, str]]:
     
     parsed_messages = []
 
+    #parse handle for deletion task later
     for message in messages:
         try: 
             attributes = message.get('MessageAttributes', {})
@@ -125,88 +132,144 @@ def delete_messages(sqs_url: str, messages_to_delete: List[Tuple[int, str, str]]
     logger.info(f"Total messages deleted in this run: {deleted_messages}")
     return deleted_messages
 
-@task(name = "Reassemble and Submit Total Messages")
-def submit_total_messages(all_messages: List[Tuple[int, str]]):
+#task to initialize duckdb and create fragments table
+@task(name = "initialize DuckDB")
+def initialize_duckdb():
     logger = get_run_logger()
-    logger.info("Reassembling and submitting total messages to external endpoint")
+    logger.info("Initializing DuckDB database for message storage")
+    try:
+        conn = duckdb.connect(DUCKDB_FILE)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS fragments (
+                order_no INTEGER PRIMARY KEY,
+                word VARCHAR
+            )
+        """)
+        conn.close()
+        logger.info("DuckDB initialized successfully.")
+    except Exception as e:
+        logger.error(f"Error initializing DuckDB: {e}")
+        raise
 
-    if len(all_messages) != TOTAL_MESSAGES:
-        logger.error(f"Cannot submit: Expected {TOTAL_MESSAGES} fragments but only received {len(all_messages)}.")
+#task to save message fragments to duckdb, listing order no and word
+@task(name = "Save fragments to DuckDB")
+def save_to_duckdb(fragments: List[Tuple[int, str]]):
+    logger = get_run_logger()
+    logger.info("Saving message fragments to DuckDB")
+    if not fragments:
+        logger.info("No fragments to save. Exiting task.")
+        return
+    try:
+        conn = duckdb.connect(DUCKDB_FILE)
+        for order_no, word in fragments:
+            conn.execute("""
+                INSERT OR REPLACE INTO fragments (order_no, word) VALUES (?, ?)
+            """, (order_no, word))
+        conn.close()
+        logger.info("Fragments saved to DuckDB successfully.")
+    except Exception as e:
+        logger.error(f"Error saving fragments to DuckDB: {e}")
+        raise
+
+#counting rows in duckdb table for monitoring progress
+@task(name = "count rows in DuckDB")
+def count_duckdb_rows() -> int:
+    logger = get_run_logger()
+    logger.info("Counting rows in DuckDB fragments table")
+    try:
+        with duckdb.connect(DUCKDB_FILE) as con:
+            count = con.execute("SELECT COUNT(*) FROM fragments").fetchone()[0]
+        return count
+    except Exception as e:
+        logger.error(f"Error counting rows in DuckDB: {e}")
+        return 0
+
+#final submission task, pulls fragments from duckdb, reassembles message, and submits to SQS
+@task(name = "Reassemble and Submit Total Messages")
+def submit_total_messages():
+    logger = get_run_logger()
+    logger.info("Reassembling and submitting total messages from duckdb")
+
+    try:
+        with duckdb.connect(DUCKDB_FILE) as con:
+            sorted_fragments = con.execute("SELECT order_no, word FROM fragments ORDER BY order_no").fetchall()
+    except Exception as e:
+        logger.error(f"Error reading from DuckDB for submission: {e}")
         return
     
-    sorted_messages = sorted(all_messages, key=lambda x: x[0])
+    if len(sorted_fragments) != TOTAL_MESSAGES:
+        logger.error(f"Cannot submit: Expected {TOTAL_MESSAGES} fragments but found {len(sorted_fragments)} in database.")
+        return
     
-    final_message = ''.join(word for order_no, word in sorted_messages)  
+    final_message = ' '.join(word for order_no, word in sorted_fragments) 
 
-    logger.info(f"Final reassembled message: {final_message}")        
-    
+    logger.info(f"Final reassembled message: {final_message}")
+
     try:
         response = SQS_CLIENT.send_message(
             QueueUrl=SUBMISSION_URL,
-            MessageBody= 'Final Message to Submit from Anna Yao',
+            MessageBody= f'Final Message to Submit from zzz2bx',
             MessageAttributes={
-                'uvaid': {
-                    'DataType': 'String',
-                    'StringValue': 'zzz2bx'
-                },
-                'phrase': {
-                    'DataType': 'String',
-                    'StringValue': final_message
-                },
-                'platform': {
-                    'DataType': 'String',
-                    'StringValue': 'Prefect'
-                }
+                'uvaid': { 'DataType': 'String', 'StringValue': 'zzz2bx' },
+                'phrase': { 'DataType': 'String', 'StringValue': final_message },
+                'platform': { 'DataType': 'String', 'StringValue': 'prefect' }
             }
-        )
-        print(f"Response: {response}")
-        
-        response.raise_for_status()
-        if response.status_code != 200:
-            logger.error(f"Failed to submit message. Status code: {response.status_code}, Response: {response.text}")
-            return
-        logger.info(f"Successfully submitted message. Response: {response.text}")
-    except httpx.HTTPError as e:
-        logger.error(f"Error submitting final message: {e}")
-        
+        ) 
+        logger.info(f"Submission response: {response}")
+        http_status = response.get('ResponseMetadata', {}).get('HTTPStatusCode')
+        if http_status and 200 <= http_status < 300:
+            logger.info(f"Solution successfully submitted! HTTP Status: {http_status}, Message ID: {response.get('MessageId')}")
+        else:
+            logger.error(f"Submission failed or returned non-200 status: {http_status}. Response: {response}")
 
+    except Exception as e:
+        logger.error(f"Error submitting final message to SQS: {e}")
+
+#flow that uses a while loop to poll SQS for new messages every minute for 20 minutes or until all messages are pulled
 @flow(name = "SQS Message Processing Flow")
-def master_sqs_puzzle_flow(sqs_url: str, collected_fragments: List[Tuple[int, str]] = None) -> List[Tuple[int, str]]:
+def puzzle_flow():
     logger = get_run_logger()
-    if collected_fragments is None:
-        collected_fragments = []
-
-    total_in_queue = get_total_message_count(sqs_url)
-
-    if total_in_queue > 0:
-        new_messages = collect_messages(sqs_url)
-        if new_messages:
-            new_fragments = [(order_no, word) for order_no, word, handle in new_messages]
-            
-            logger.info(f"Appended {len(new_fragments)} new fragments")
-
-            delete_messages(sqs_url, new_messages)
-
-            return new_fragments
-        else:
-            logger.info("No visible messages to collect. Waiting for delayed messages to expire.")
-            return []
-    elif total_in_queue == 0:
-        logger.info("Queue is empty. Checking for collected fragments to submit.")
-        if len(collected_fragments) == TOTAL_MESSAGES:
-            submit_total_messages(collected_fragments)
-            return collected_fragments
-        else:
-            logger.warning(f"Queue is empty, but only {len(collected_fragments)} fragments were accumulated. Check previous run logs or data persistence.")
-            return collected_fragments
+    logger.info("Starting SQS Message Processing Flow")
+    try:
+        sqs_url = fetch_messages()
+        initialize_duckdb()
+    except Exception as e:
+        logger.error(f"Flow initialization failed: {e}")
+        return
     
-    return []     
+    start_time = time.time()
+    max_duration_seconds = 20 * 60  # 20 minutes
+    poll_interval_seconds = 60
 
-@flow(name="Initialize")
-def initialize_queue_flow():
-    return fetch_messages()
+    logger.info(f"Initialization complete. Starting 20-minute collection loop. Polling every {poll_interval_seconds}s.")
+
+    while time.time() - start_time < max_duration_seconds:
+        try:
+            total_count = get_total_message_count(sqs_url)
+            if total_count > 0:
+                new_messages_with_handles = collect_messages(sqs_url)
+
+                if new_messages_with_handles:
+                    new_fragments = [(order_no, word) for order_no, word, handle in new_messages_with_handles]
+                    save_to_duckdb(new_fragments)
+                    deleted_count = delete_messages(sqs_url, new_messages_with_handles)
+                    logger.info(f"Processed {len(new_messages_with_handles)} new messages, deleted {deleted_count} from SQS.")
+            fragments_in_db = count_duckdb_rows()
+            logger.info(f"Total fragments stored in DuckDB: {fragments_in_db}/{TOTAL_MESSAGES}")
+            if fragments_in_db == TOTAL_MESSAGES:
+                logger.info("All message fragments collected. Proceeding to submission.")
+                break
+        except Exception as e:
+            logger.error(f"Error during collection loop: {e}")
+
+        logger.info(f"Cycle complete. Sleeping for {poll_interval_seconds} seconds...")
+        time.sleep(poll_interval_seconds)
+
+    logger.info("Loop finished. Proceeding to final reassembly and submission.")
+    submit_total_messages() 
+
 
 if __name__ == "__main__":
-    initialize_queue_flow()
+    puzzle_flow()
             
 
