@@ -36,7 +36,7 @@ def initialize_duckdb():
     try:
         conn = duckdb.connect(DUCKDB_FILE)
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS fragments (
+            CREATE OR REPLACE TABLE fragments (
                 order_no INTEGER PRIMARY KEY,
                 word VARCHAR
             )
