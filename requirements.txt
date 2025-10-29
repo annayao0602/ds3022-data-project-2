@@ -3,3 +3,4 @@ requests
 prefect
 httpx
 typing
+apache-airflow
